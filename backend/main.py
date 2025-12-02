@@ -22,6 +22,13 @@ from services.docx_utils import salvar_sentenca_como_docx, salvar_docs_referenci
 from services.docx_parser import parse_docx_bytes
 from preprocessing.sentence_indexing_rag import setup_elasticsearch
 
+# Imports opcionais para arquitetura multi-agente (comentados para simplificar)
+# from agents.state import AgentState
+# from agents.graph import run_agent_graph
+# from agents.timeline_agent import TimelineAgent
+# from agents.graph_agent import GraphAgent
+# from ingestion.classifier import DocumentClassifier
+
 app = FastAPI(title="RAG TJPE API")
 
 
@@ -813,6 +820,46 @@ async def global_exception_handler(request, exc):
     """
     print(f"❌ Erro não tratado: {exc}")
     return {"error": "Erro interno do servidor", "detail": str(exc)}
+
+
+# ─────────────────────────── Endpoints Multi-Agente ───────────────
+# COMENTADOS: Endpoints de agentes não são necessários para os requisitos básicos do curso
+# Descomente se quiser usar a arquitetura multi-agente completa
+
+# class AgentProcessRequest(BaseModel):
+#     """Request para processamento via agentes"""
+#     text: Optional[str] = None
+#     intent: Optional[str] = None  # timeline, graph, transcription, write, all
+#     instructions: Optional[str] = None
+#     numero_processo: Optional[str] = None
+#
+#
+# class AgentProcessResponse(BaseModel):
+#     """Response do processamento via agentes"""
+#     timeline: Optional[dict] = None
+#     graph: Optional[dict] = None
+#     transcription: Optional[dict] = None
+#     output: Optional[str] = None
+#     metadata: dict
+#     completed_agents: List[str]
+#     errors: List[str]
+#
+#
+# @app.post("/agents/process", response_model=AgentProcessResponse)
+# async def process_with_agents(...):
+#     ...
+#
+# @app.post("/agents/timeline")
+# async def extract_timeline(...):
+#     ...
+#
+# @app.post("/agents/graph")
+# async def extract_graph(...):
+#     ...
+#
+# @app.post("/agents/classify")
+# async def classify_document(...):
+#     ...
 
 
 if __name__ == "__main__":

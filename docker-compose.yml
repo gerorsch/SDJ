@@ -34,7 +34,7 @@ services:
     ports:
       - "9200:9200"
     volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
+      - ./data/elasticsearch:/usr/share/elasticsearch/data
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
       interval: 30s
@@ -56,7 +56,7 @@ services:
     working_dir: /app
     command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
     ports:
-      - "8001:8001"
+      - "8010:8001"
     environment:
       - ELASTICSEARCH_HOST=http://elasticsearch:9200
       - POSTGRES_HOST=postgres

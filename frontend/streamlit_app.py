@@ -18,7 +18,7 @@ import json
 from auth_tjpe import require_authentication, show_admin_panel
 
 load_dotenv()
-API_URL = os.getenv("API_URL", "http://localhost:8001")
+API_URL = os.getenv("API_URL", "http://localhost:8010")
 
 def limpar_relatorio(texto_bruto):
     """
