@@ -195,7 +195,7 @@ curl http://localhost:9200/_cluster/health
 - **Nginx**: Proxy reverso
 - **Claude/OpenAI**: Modelos de linguagem para geração de sentenças
 
-## ✅ Requisitos do Projeto Atendidos
+## ✅ Requisitos do Projeto Atendidos até o momento
 
 - ✅ **Sistema Distribuído**: 5 módulos (processos) independentes
 - ✅ **Interface Gráfica**: Streamlit permite acesso a todas as funcionalidades
@@ -203,37 +203,6 @@ curl http://localhost:9200/_cluster/health
 - ✅ **Containerização**: Todos os módulos rodam em containers Docker
 - ✅ **Repositório Git**: Código versionado (obrigatório desde primeira semana)
 
-## 📝 Notas para Apresentação
-
-### Pontos a Destacar no Vídeo:
-
-1. **Arquitetura**: Mostrar os 5 módulos e como se comunicam
-2. **Funcionalidades**: 
-   - Upload e processamento de PDF
-   - Extração de relatório
-   - Geração automática de sentença
-3. **Distribuição**: Mostrar que cada módulo é um processo/container independente
-4. **Comunicação**: Demonstrar fluxo de dados entre módulos
-5. **Código**: Mostrar estrutura do projeto e principais arquivos
-
-## 🔧 Desenvolvimento
-
-### Adicionar Novo Endpoint no Backend
-
-1. Edite `backend/main.py`
-2. Adicione a rota FastAPI
-3. Reinicie o container: `docker-compose restart fastapi`
-
-### Modificar Frontend
-
-1. Edite `frontend/streamlit_app.py`
-2. O Streamlit recarrega automaticamente (hot reload)
-
-## 📞 Contato
-
-Para dúvidas sobre o projeto, consulte o repositório Git ou entre em contato com a equipe.
-
----
 
 **Versão**: 1.0  
-**Última Atualização**: 02/12/2024
+**Última Atualização**: 02/12/2025
