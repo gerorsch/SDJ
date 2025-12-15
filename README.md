@@ -9,15 +9,15 @@ Sistema distribuído para processamento de documentos jurídicos, extração de 
 
 ## 🏗️ Arquitetura do Sistema
 
-O sistema é composto por **5 módulos distribuídos** (processos independentes):
+O sistema é composto por **8 módulos distribuídos** (processos independentes):
 
 ### Módulos do Sistema
 
-1. **Frontend (Streamlit)** - Interface Gráfica
-   - Container: `streamlit`
-   - Porta: `8501`
+1. **Frontend (Next.js + TypeScript)** - Interface Gráfica
+   - Container: `frontend`
+   - Porta: `3000`
    - Responsabilidade: Interface gráfica para usuários acessarem todas as funcionalidades
-   - Tecnologia: Python + Streamlit
+   - Tecnologia: Next.js 14 + TypeScript + React
 
 2. **Backend API (FastAPI)** - Processamento de Documentos
    - Container: `fastapi`
@@ -25,8 +25,12 @@ O sistema é composto por **5 módulos distribuídos** (processos independentes)
    - Responsabilidade: Processa PDFs, extrai relatórios, gera sentenças via LLM
    - Tecnologia: Python + FastAPI
    - Endpoints principais:
-     - `POST /processar` - Extrai relatório de PDF
-     - `POST /gerar-sentenca` - Gera sentença baseada em relatório e referências
+     - `POST /processar` - Extrai relatório de PDF (síncrono - compatibilidade)
+     - `POST /queue/processar` - Enfileira processamento de PDF (assíncrono)
+     - `POST /gerar-sentenca` - Gera sentença baseada em relatório (síncrono - compatibilidade)
+     - `POST /queue/gerar-sentenca` - Enfileira geração de sentença (assíncrono)
+     - `GET /tasks/{task_id}/status` - Verifica status de uma tarefa
+     - `GET /tasks/{task_id}/result` - Obtém resultado de uma tarefa concluída
      - `GET /health` - Health check
 
 3. **Elasticsearch** - Motor de Busca Semântica (RAG)
@@ -46,6 +50,25 @@ O sistema é composto por **5 módulos distribuídos** (processos independentes)
    - Porta: `80`
    - Responsabilidade: Roteamento e balanceamento de requisições
    - Tecnologia: Nginx
+
+6. **RabbitMQ** - Message Broker
+   - Container: `rabbitmq`
+   - Porta: `5672` (AMQP), `15672` (Management UI)
+   - Responsabilidade: Gerenciamento de filas de mensagens para processamento assíncrono
+   - Tecnologia: RabbitMQ 3-management-alpine
+   - Acesso Management UI: http://localhost:15672 (guest/guest)
+
+7. **Celery Worker** - Processamento Assíncrono
+   - Container: `celery_worker`
+   - Responsabilidade: Processa tarefas pesadas (PDFs, geração de sentenças) em background
+   - Tecnologia: Celery 5.3+ + Python
+   - Concurrency: 2 workers simultâneos
+
+8. **Sistema de Filas**
+   - Processamento assíncrono de operações pesadas
+   - Endpoints de fila: `/queue/processar` e `/queue/gerar-sentenca`
+   - Polling de status: `/tasks/{task_id}/status`
+   - Melhora escalabilidade e experiência do usuário
 
 ## 🔄 Comunicação entre Componentes
 
@@ -83,15 +106,36 @@ O sistema é composto por **5 módulos distribuídos** (processos independentes)
 └─────────────┘
 ```
 
-### Fluxo de Dados
+### Fluxo de Dados (com Sistema de Filas)
 
-1. **Upload de PDF**: Usuário faz upload via Frontend → Frontend envia para Backend
-2. **Processamento**: Backend processa PDF → Extrai texto → Salva no Elasticsearch
-3. **Geração de Sentença**: 
-   - Backend busca sentenças similares no Elasticsearch (RAG)
-   - Backend chama LLM (Claude/OpenAI) para gerar sentença
-   - Backend retorna resultado para Frontend
-4. **Exibição**: Frontend exibe sentença gerada e permite download
+1. **Upload de PDF (Assíncrono)**:
+   - Usuário faz upload via Frontend
+   - Frontend envia para Backend (`POST /queue/processar`)
+   - Backend enfileira tarefa no RabbitMQ
+   - Backend retorna `task_id` imediatamente (202 Accepted)
+   - Frontend faz polling do status (`GET /tasks/{task_id}/status`)
+   - Celery Worker processa PDF em background
+   - Frontend recebe resultado quando concluído
+
+2. **Geração de Sentença (Assíncrono)**:
+   - Usuário configura parâmetros e clica "Gerar Sentença"
+   - Frontend envia para Backend (`POST /queue/gerar-sentenca`)
+   - Backend enfileira tarefa no RabbitMQ
+   - Backend retorna `task_id` imediatamente (202 Accepted)
+   - Frontend faz polling do status
+   - Celery Worker:
+     - Busca sentenças similares no Elasticsearch (RAG)
+     - Chama LLM (Claude/OpenAI) para gerar sentença
+     - Salva arquivos (.docx e .zip)
+   - Frontend recebe resultado quando concluído
+
+3. **Exibição**: Frontend exibe sentença gerada e permite download
+
+**Benefícios do Sistema de Filas**:
+- Resposta imediata ao usuário (não precisa esperar processamento)
+- Melhor escalabilidade (múltiplos workers podem processar em paralelo)
+- Resiliência (tarefas não se perdem se worker cair)
+- Controle de carga (limite de workers simultâneos)
 
 ## 🚀 Como Executar
 

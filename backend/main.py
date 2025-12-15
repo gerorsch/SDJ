@@ -15,21 +15,25 @@ import os
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from preprocessing.sentence_indexing_rag import setup_elasticsearch
 from preprocessing.process_report_pipeline import Config, generate as gerar_relatorio
 from services.retrieval_rerank import recuperar_documentos_similares as semantic_search_rerank
 from services.llm import gerar_sentenca_llm
 from services.docx_utils import salvar_sentenca_como_docx, salvar_docs_referencia
 from services.docx_parser import parse_docx_bytes
-from preprocessing.sentence_indexing_rag import setup_elasticsearch
+from services.auth import router as auth_router
+from services.auth import ensure_auth_schema
+from database.postgres import init_postgres_pool, close_postgres_pool
+from celery.result import AsyncResult
+from tasks.celery_app import celery_app
+from tasks.pdf_tasks import processar_pdf_task, gerar_sentenca_task
 
-# Imports opcionais para arquitetura multi-agente (comentados para simplificar)
-# from agents.state import AgentState
-# from agents.graph import run_agent_graph
-# from agents.timeline_agent import TimelineAgent
-# from agents.graph_agent import GraphAgent
-# from ingestion.classifier import DocumentClassifier
+
+
 
 app = FastAPI(title="RAG TJPE API")
+
+app.include_router(auth_router)
 
 
 # Configurar CORS
@@ -42,16 +46,24 @@ def get_allowed_origins():
     production_origins = [
         "https://justino.digital",
         "https://www.justino.digital",
-        "https://api.justino.digital",
+        "https://app.justino.digital",
     ]
     
     # URLs de desenvolvimento local
     development_origins = [
         "http://localhost:8501",
         "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:3003",
+        "http://localhost:3004",
         "http://localhost:8000",
         "http://127.0.0.1:8501",
         "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3002",
+        "http://127.0.0.1:3003",
+        "http://127.0.0.1:3004",
         "http://127.0.0.1:8000",
     ]
     
@@ -112,43 +124,75 @@ async def health_check():
         "allowed_origins": len(allowed_origins)
     }
 
-# ─────────────────────────── Eventos de Inicialização ───────────────────────────
+# # ─────────────────────────── Eventos de Inicialização ───────────────────────────
+# INICIALIZAÇÃO FOI TRANSFERIDA PARA GUNICORN_CONF.PY
+
+# @app.on_event("startup")
+# async def startup_event():
+#     """
+#     1) Limpa arquivos /tmp
+#     2) Garante que o índice do Elasticsearch exista e, se vazio, popule com sentenças
+#     """
+#     # ———————————— limpeza atual ————————————
+#     await ensure_auth_schema()  
+#     print("🧹 Limpando arquivos temporários antigos...")
+#     now = time.time()
+#     patterns = ["/tmp/sentenca_*.docx", "/tmp/referencias_*.zip", "/tmp/*.pdf"]
+#     removed_count = 0
+    
+#     for pattern in patterns:
+#         for file in glob.glob(pattern):
+#             try:
+#                 if now - os.path.getctime(file) > 86400:  # 24 horas
+#                     os.remove(file)
+#                     removed_count += 1
+#             except:
+#                 pass
+    
+#     if removed_count > 0:
+#         print(f"✅ Removidos {removed_count} arquivos temporários antigos")
+    
+#     # ———————————— novo bloco ————————————
+#     print("🔍 Configurando Elasticsearch (índice + dados)…")
+#     try:
+#         setup_elasticsearch()
+#         print("✅ Elasticsearch pronto para uso")
+#     except Exception as e:
+#         print(f"❌ Falha no setup do Elasticsearch: {e}")
+#         # opcional: raise para abortar startup
+#         # raise
+#     try:
+#         await ensure_auth_schema()  # cria tabelas/índices caso faltem
+#         print("✅ Auth schema pronto")
+#     except Exception as e:
+#         print(f"❌ Falha ao preparar auth schema: {e}")
 
 @app.on_event("startup")
-async def startup_event():
-    """
-    1) Limpa arquivos /tmp
-    2) Garante que o índice do Elasticsearch exista e, se vazio, popule com sentenças
-    """
-    # ———————————— limpeza atual ————————————
-    print("🧹 Limpando arquivos temporários antigos...")
-    now = time.time()
-    patterns = ["/tmp/sentenca_*.docx", "/tmp/referencias_*.zip", "/tmp/*.pdf"]
-    removed_count = 0
-    
-    for pattern in patterns:
-        for file in glob.glob(pattern):
-            try:
-                if now - os.path.getctime(file) > 86400:  # 24 horas
-                    os.remove(file)
-                    removed_count += 1
-            except:
-                pass
-    
-    if removed_count > 0:
-        print(f"✅ Removidos {removed_count} arquivos temporários antigos")
-    
-    # ———————————— novo bloco ————————————
-    print("🔍 Configurando Elasticsearch (índice + dados)…")
-    try:
-        setup_elasticsearch()
-        print("✅ Elasticsearch pronto para uso")
-    except Exception as e:
-        print(f"❌ Falha no setup do Elasticsearch: {e}")
-        # opcional: raise para abortar startup
-        # raise
+async def _startup():
+    # Cada worker cria seu próprio pool (rápido e barato)
+    await init_postgres_pool()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    # Fecha o pool do worker de forma limpa
+    await close_postgres_pool()
+
+# ─────────────────────────── Modelos de tarefas Celery ───────────────────────────
+class TaskEnqueueResponse(BaseModel):
+    task_id: str
+    status: str
 
 
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    progress: Optional[str] = None
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[dict] = None
 
 # ─────────────────────────── Utilitários ───────────────────────────
 
@@ -327,7 +371,6 @@ async def processar_pdf(pdf: UploadFile = File(...)):
         # Limpa arquivo temporário
         limpar_arquivo_temporario(tmp_path)
 
-
 class Documento(BaseModel):
     id: str
     relatorio: str
@@ -373,8 +416,8 @@ async def gerar_sentenca_endpoint(
         docs: List[dict] = []
         if arquivos_referencia:
             for upload in arquivos_referencia:
-                if not upload.filename.lower().endswith('.docx'):
-                    raise HTTPException(status_code=400, detail=f"Arquivo {upload.filename} deve ser DOCX")
+                # if not upload.filename.lower().endswith('.docx'):
+                #     raise HTTPException(status_code=400, detail=f"Arquivo {upload.filename} deve ser DOCX")
                 
                 data = await upload.read()
                 sec = parse_docx_bytes(data)
@@ -401,6 +444,8 @@ async def gerar_sentenca_endpoint(
             docs=docs,
             instrucoes_usuario=instrucoes_usuario,
         )
+        
+        print("DEBUG >>> SENTENCA GERADA:", repr(sentenca)[:500])
 
         # 3) Gera nomes de arquivo baseados no número do processo
         nome_base_sentenca = gerar_nome_arquivo_sentenca(numero_processo)
@@ -409,8 +454,16 @@ async def gerar_sentenca_endpoint(
         sent_id = f"{nome_base_sentenca}_{uuid.uuid4().hex[:8]}"
         refs_id = f"{nome_base_referencias}_{uuid.uuid4().hex[:8]}"
         
-        sent_path = f"/tmp/{sent_id}.docx"
-        refs_path = f"/tmp/{refs_id}.zip"
+        SENTENCA_DIR = "/output_files/sentenca"
+        REFS_DIR = "/output_files/referencias"
+
+        # Garante que os subdiretórios existam dentro do volume
+        os.makedirs(SENTENCA_DIR, exist_ok=True)
+        os.makedirs(REFS_DIR, exist_ok=True)
+
+        # Define o caminho completo dos arquivos para salvar
+        sent_path = os.path.join(SENTENCA_DIR, f"{sent_id}.docx")
+        refs_path = os.path.join(REFS_DIR, f"{refs_id}.zip")
 
         # 4) Salvar .docx e ZIP de referências com número do processo
         salvar_sentenca_como_docx(
@@ -445,49 +498,6 @@ async def gerar_sentenca_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na geração da sentença: {str(e)}")
-
-
-# ───────────────────────────── Downloads ──────────────────────────────
-
-@app.get("/download/sentenca/{file_id}.docx")
-def download_sentenca(file_id: str):
-    """
-    Download da sentença gerada
-    """
-    # Validação básica do file_id
-    if not re.match(r'^[a-zA-Z0-9_-]+$', file_id):
-        raise HTTPException(status_code=400, detail="ID de arquivo inválido")
-    
-    path = f"/tmp/{file_id}.docx"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Sentença não encontrada")
-    
-    return FileResponse(
-        path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=f"{file_id}.docx"
-    )
-
-
-@app.get("/download/referencias/{file_id}.zip")
-def download_referencias(file_id: str):
-    """
-    Download das referências (ZIP)
-    """
-    # Validação básica do file_id
-    if not re.match(r'^[a-zA-Z0-9_-]+$', file_id):
-        raise HTTPException(status_code=400, detail="ID de arquivo inválido")
-    
-    path = f"/tmp/{file_id}.zip"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="ZIP não encontrado")
-    
-    return FileResponse(
-        path, 
-        media_type="application/zip",
-        filename=f"{file_id}.zip"
-    )
-
 
 # ───────────────────────────── Rotas SSE ─────────────────────────────
 
@@ -619,8 +629,17 @@ async def stream_gerar_sentenca(
         sent_id = f"{nome_base_sentenca}_{uuid.uuid4().hex[:8]}"
         refs_id = f"{nome_base_referencias}_{uuid.uuid4().hex[:8]}"
         
-        sent_path = f"/tmp/{sent_id}.docx"
-        refs_path = f"/tmp/{refs_id}.zip"
+# Define os diretórios de saída DENTRO do volume compartilhado
+        SENTENCA_DIR = "/output_files/sentenca"
+        REFS_DIR = "/output_files/referencias"
+
+        # Garante que os subdiretórios existam dentro do volume
+        os.makedirs(SENTENCA_DIR, exist_ok=True)
+        os.makedirs(REFS_DIR, exist_ok=True)
+
+        # Define o caminho completo dos arquivos para salvar
+        sent_path = os.path.join(SENTENCA_DIR, f"{sent_id}.docx")
+        refs_path = os.path.join(REFS_DIR, f"{refs_id}.zip")
 
         def on_progress(msg: str):
             queue.put_nowait(msg)
@@ -822,44 +841,36 @@ async def global_exception_handler(request, exc):
     return {"error": "Erro interno do servidor", "detail": str(exc)}
 
 
-# ─────────────────────────── Endpoints Multi-Agente ───────────────
-# COMENTADOS: Endpoints de agentes não são necessários para os requisitos básicos do curso
-# Descomente se quiser usar a arquitetura multi-agente completa
+# ─────────────────────────── Fila Celery (Roteamento) ───────────────────────────
+@app.post("/queue/processar", response_model=TaskEnqueueResponse)
+async def queue_processar(pdf: UploadFile = File(...)):
+    """Enfileira processamento de PDF"""
+    if not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo PDF")
+    data = await pdf.read()
+    task = processar_pdf_task.delay(data, pdf.filename)
+    return TaskEnqueueResponse(task_id=task.id, status="QUEUED")
 
-# class AgentProcessRequest(BaseModel):
-#     """Request para processamento via agentes"""
-#     text: Optional[str] = None
-#     intent: Optional[str] = None  # timeline, graph, transcription, write, all
-#     instructions: Optional[str] = None
-#     numero_processo: Optional[str] = None
-#
-#
-# class AgentProcessResponse(BaseModel):
-#     """Response do processamento via agentes"""
-#     timeline: Optional[dict] = None
-#     graph: Optional[dict] = None
-#     transcription: Optional[dict] = None
-#     output: Optional[str] = None
-#     metadata: dict
-#     completed_agents: List[str]
-#     errors: List[str]
-#
-#
-# @app.post("/agents/process", response_model=AgentProcessResponse)
-# async def process_with_agents(...):
-#     ...
-#
-# @app.post("/agents/timeline")
-# async def extract_timeline(...):
-#     ...
-#
-# @app.post("/agents/graph")
-# async def extract_graph(...):
-#     ...
-#
-# @app.post("/agents/classify")
-# async def classify_document(...):
-#     ...
+
+@app.get("/tasks/{task_id}/status", response_model=TaskStatusResponse)
+async def task_status(task_id: str):
+    """Retorna status/progresso de uma task Celery"""
+    result = AsyncResult(task_id, app=celery_app)
+    progress = None
+    if isinstance(result.info, dict):
+        progress = result.info.get("progress")
+    return TaskStatusResponse(task_id=task_id, status=result.status, progress=progress)
+
+
+@app.get("/tasks/{task_id}/result", response_model=TaskResultResponse)
+async def task_result(task_id: str):
+    """Retorna resultado final de uma task Celery"""
+    result = AsyncResult(task_id, app=celery_app)
+    if result.state in ("PENDING", "STARTED", "RETRY"):
+        raise HTTPException(status_code=202, detail="Task ainda em processamento")
+    if result.failed():
+        raise HTTPException(status_code=500, detail=str(result.info))
+    return TaskResultResponse(task_id=task_id, status=result.state, result=result.get())
 
 
 if __name__ == "__main__":

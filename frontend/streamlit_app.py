@@ -1,7 +1,7 @@
 
 import streamlit as st
 
-st.set_page_config(page_title="Justino — Assessor Digital", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="SDJ - Sistema Distribuído Jurídico", page_icon="⚖️", layout="wide")
 
 import os
 import requests
@@ -178,11 +178,10 @@ def main_app():
         
         st.markdown("---")
         
-        st.markdown("### 🚀 Como usar o Justino")
+        st.markdown("### 🚀 Como usar o SDJ")
             
         st.markdown("#### **1. Extração do Relatório**")
         st.markdown("""
-        - Baixe o processo do PJe em ordem CRESCENTE
         - Faça o upload do processo em PDF (máx. 200MB)
         - Clique em **"Extrair Relatório"**
         - Aguarde o processamento completo
@@ -231,11 +230,12 @@ def main_app():
             - **Rerank Top K (5 padrão)**: Manter baixo para maior precisão
             """)
             
-        st.markdown("#### **📞 Suporte**")
+        st.markdown("#### **📞 Informações do Projeto**")
         st.markdown("""
-        Para dúvidas ou problemas:
-        - **Email**: george.queiroz@tjpe.jus.br
-        - **Versão**: BETA v2.1 (Backend Otimizado)
+        **SDJ - Sistema Distribuído Jurídico**
+        - Projeto acadêmico para Sistemas Distribuídos
+        - Versão: 1.0 (Protótipo)
+        - Data: 02/12/2024
         """)
             
         # Status do sistema
@@ -250,7 +250,7 @@ def main_app():
         except:
             st.error("🔴 Sistema Offline")
 
-    st.title("⚖️ Justino — Assessor Digital da 13ª Vara Cível - Seção A")
+    st.title("⚖️ SDJ - Sistema Distribuído Jurídico")
 
     st.markdown("<br><br><br><br>", unsafe_allow_html=True)
 
@@ -758,10 +758,10 @@ def main_app():
     st.markdown("---")
     st.markdown(f"""
     <div style="text-align: center; color: #666; font-size: 0.9em; margin-top: 2rem;">
-        <p><strong>⚖️ Justino - Assessor Digital da 13ª Vara Cível - Seção A</strong></p>
-        <p>Versão BETA v2.1 | maio de 2025</p>
-        <p><strong>👤 Usuário:</strong> {st.session_state.user_info['full_name']} | <strong>📧</strong> {st.session_state.user_info['email']}</p>
-        <p><em>⚠️ Sempre revise o conteúdo gerado antes do lançar a minuta</em></p>
+        <p><strong>⚖️ SDJ - Sistema Distribuído Jurídico</strong></p>
+        <p>Projeto Acadêmico - Sistemas Distribuídos | Versão 1.0 | 02/12/2024</p>
+        <p><strong>👤 Usuário:</strong> {st.session_state.user_info.get('full_name', 'Usuário')} | <strong>📧</strong> {st.session_state.user_info.get('email', 'N/A')}</p>
+        <p><em>⚠️ Sempre revise o conteúdo gerado antes do uso</em></p>
     </div>
     """, unsafe_allow_html=True)
 

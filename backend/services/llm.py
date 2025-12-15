@@ -1,163 +1,130 @@
 import os
-from dotenv import load_dotenv
-from typing import List, Optional, Callable
-import anthropic
+import random
+import time
+import math
+import asyncio
+from typing import Callable, Optional, List, Dict, Any
+from openai import OpenAI
+from anthropic import Anthropic
 
-load_dotenv()
+# Providers
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()  # 'openai' | 'anthropic'
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5").strip()
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "128000"))
+desired = LLM_MAX_TOKENS
+_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if LLM_PROVIDER == "openai" else None
+_anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")) if LLM_PROVIDER == "anthropic" else None
 
-# ───────────────────────────────────────────────────
-# Parâmetros de configuração para o LLM (Anthropic)
-# ───────────────────────────────────────────────────
-LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
-
-# Inicializa o client da Anthropic
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-
-def _extract_text_from_response(response_content) -> str:
-    """
-    Extrai o texto da resposta do Claude de forma segura.
-    A API do Anthropic retorna response.content como lista de TextBlocks ou string.
-    """
-    if not response_content:
-        return ""
-    if isinstance(response_content, str):
-        return response_content
-
-    # Se for lista de TextBlocks (caso comum)
-    if isinstance(response_content, list):
-        text_parts = []
-        for block in response_content:
-            if hasattr(block, 'text'):
-                text_parts.append(str(block.text))
-            elif isinstance(block, dict) and 'text' in block:
-                text_parts.append(str(block['text']))
-            elif isinstance(block, str):
-                text_parts.append(block)
-            else:
-                text_parts.append(str(block))
-        result = ''.join(text_parts)
-        return result.replace('\\n', '\n').replace('\\r', '')
-
-    # Fallback genérico
-    result = str(response_content)
-    return result.replace('\\n', '\n').replace('\\r', '')
-
-
-async def _call_llm(prompt: str, on_progress: Optional[Callable[[str], None]] = None) -> str:
-    """
-    Chama a API da Anthropic (Claude) e retorna a resposta do modelo em texto puro.
-    """
+if LLM_PROVIDER == "openai":
     try:
-        if on_progress:
-            on_progress("🤖 Consultando Claude...")
-        response = client.messages.create(
-            model=LLM_MODEL,
-            max_tokens=LLM_MAX_TOKENS,
-            temperature=LLM_TEMPERATURE,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        if on_progress:
-            on_progress("📝 Processando resposta...")
-        text = _extract_text_from_response(response.content)
-        return text.strip()
+        from openai import OpenAI  # SDK v1
+        _openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     except Exception as e:
-        error_msg = f"Erro na chamada da API Anthropic: {e}"
-        print(error_msg)
-        if on_progress:
-            on_progress(f"❌ {error_msg}")
-        return f"Erro na geração de conteúdo: {str(e)}"
-
-
-async def gerar_resposta_llm(pergunta: str, documentos: List[dict]) -> str:
-    """
-    Gera uma resposta genérica para uma pergunta, usando o texto dos documentos como contexto.
-    """
+        raise RuntimeError(f"Falha ao inicializar OpenAI client: {e}")
+elif LLM_PROVIDER == "anthropic":
     try:
-        # Usa relatorio ou, como fallback, 'text' (caso a chave relatorio tenha sido sobrescrita)
-        context = "\n\n".join([doc.get("relatorio") or doc.get("text", "") for doc in documentos])
-        prompt = f"Contexto:\n{context}\n\nPergunta: {pergunta}\nResposta:"
-        return await _call_llm(prompt)
+        from anthropic import Anthropic
+        _anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     except Exception as e:
-        print(f"Erro em gerar_resposta_llm: {e}")
-        return f"Erro ao gerar resposta: {str(e)}"
+        raise RuntimeError(f"Falha ao inicializar Anthropic client: {e}")
+else:
+    raise ValueError(f"LLM_PROVIDER inválido: {LLM_PROVIDER}")
+
+def _approx_tokens(txt: str) -> int:
+    # heurística: ~4 chars por token (ajuste se quiser)
+    return max(1, math.ceil(len(txt) / 4))
+
+def _context_window_from_env(model: str) -> int:
+    # permite override específico por modelo, ex.: LLM_CONTEXT_WINDOW_GPT_5=128000
+    model_key = model.upper().replace("-", "_").replace(".", "_")
+    return int(os.getenv(f"LLM_CONTEXT_WINDOW_{model_key}", os.getenv("LLM_CONTEXT_WINDOW", "32000")))
+
+def _length_param_name(model: str) -> str:
+    # modelos de raciocínio → max_completion_tokens; demais → max_tokens
+    m = model.lower()
+    return "max_completion_tokens" if m.startswith(("gpt-5", "o1", "o3", "o4-mini")) else "max_tokens"
+
+def _cap_limit_tokens(model: str, messages, desired: int) -> int:
+    ctx_window = _context_window_from_env(model)
+    in_tokens = sum(_approx_tokens(m.get("content", "")) for m in messages)
+    safety = int(os.getenv("LLM_SAFETY_TOKENS", "512"))
+    available = ctx_window - in_tokens - safety
+    # evita negativo e limita ao desejado
+    return max(1, min(desired, max(1, available)))
 
 
-async def gerar_sentenca_llm(
-    relatorio: str, 
-    docs: List[dict], 
-    instrucoes_usuario: str = "", 
-    on_progress: Optional[Callable[[str], None]] = None,
-    **kwargs
-) -> str:
-    """
-    Gera a fundamentação e o dispositivo de uma sentença judicial com base no relatório
-    e em documentos de referência (cada dicionário em docs deve ter a chave 'relatorio').
-    """
-    try:
-        # 1) Validação de entrada
-        if not relatorio or not relatorio.strip():
-            error_msg = "Erro: Relatório não fornecido ou vazio."
-            if on_progress:
-                on_progress(f"❌ {error_msg}")
-            return error_msg
+# ===================== Grounding / Prompt =====================
+SYSTEM_PROMPT_SENTENCA = """
+Você é um juiz que redige sentenças **apenas** com base no CONTEXTO fornecido.
+Regras (obrigatórias):
+0) Inicie a sentença com o texto "É o que havia a relatar. Relatado o feito, DECIDO."
+1) Use exclusivamente informações do bloco CONTEXTO.
+2) Não cite lei/jurisprudência/precedente que não esteja no CONTEXTO.
+3) Linguagem técnica jurídica brasileira; nada de analogias criativas ou suposições.
+4) **Siga rigorosamente a ESTRUTURA DA SENTENÇA abaixo, mas sem citar os títulos.**
+5) ** Não refira aos documentos de referência, como em "conforme ilustra a jurisprudência colacionada nos **documentos de referência**". Atue como se estivesse lido os documentos de referência e incorporado seu conhecimento. Cite diretamente apenas lei e jurisprudência encontradas nos documentos de referência, e não os textos próprios do documento.
+6) **Exceção às regras 1–2:** o BLOCO DE CONCLUSÃO OBRIGATÓRIA deve ser reproduzido **exatamente** como fornecido ao final, **mesmo que não esteja no CONTEXTO**.
+7) Antes de finalizar, verifique que cada asserção feita está explicitamente suportada pelo CONTEXTO.
+""" 
 
-        if not docs:
-            error_msg = "Erro: Nenhum documento de referência fornecido."
-            if on_progress:
-                on_progress(f"❌ {error_msg}")
-            return error_msg
+def _safe_pick(d: Dict[str, Any], keys: List[str], default: str = "") -> str:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return default
 
-        if on_progress:
-            on_progress("📚 Preparando documentos de referência...")
+def _trim_text(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 3] + "..."
 
-        # 2) Constrói exemplos dos documentos, usando apenas 'relatorio' (já preenchido)
-        exemplos = []
-        for i, d in enumerate(docs, start=1):
-            trecho = f"Exemplo {i}:\n"
-            rel = d.get('relatorio', "")
-            if rel:
-                trecho += f"Relatório: {rel[:500]}...\n\n"
-            fund = d.get('fundamentacao')
-            if fund:
-                trecho += f"Fundamentação: {fund[:1000]}...\n\n"
-            disp = d.get('dispositivo')
-            if disp:
-                trecho += f"Dispositivo: {disp[:500]}...\n"
-            exemplos.append(trecho)
+def build_context(exemplos: List[Dict[str, Any]], *, max_docs: int = 5, max_chars_per_doc: int = 10000) -> str:
+    if not exemplos:
+        return "(nenhum documento fornecido)"
 
-        contexto = "\n\n---\n\n".join(exemplos)
+    blocos = []
+    for i, doc in enumerate(exemplos[:max_docs]):
+        titulo = _safe_pick(doc, ["titulo", "title", "nome"], default=f"Documento {i+1}")
+        # 👇 juntar relatorio, fundamentacao, dispositivo
+        conteudo = ""
+        for k in ["conteudo", "content", "texto", "trecho", "body", "relatorio", "fundamentacao", "dispositivo"]:
+            v = doc.get(k)
+            if isinstance(v, str) and v.strip():
+                conteudo += v.strip() + "\n\n"
+        conteudo = _trim_text(conteudo.strip(), max_chars_per_doc) if conteudo else "[sem conteúdo]"
+        blocos.append(f"Documento {i+1}: {titulo}\n---\n{conteudo}\n")
 
-        # 3) Instruções adicionais do usuário (se existirem)
-        instrucoes_adicionais = ""
-        if instrucoes_usuario and instrucoes_usuario.strip():
-            instrucoes_adicionais = (
-                "\n\n### INSTRUÇÕES ADICIONAIS DO USUÁRIO:\n" 
-                + instrucoes_usuario.strip() + "\n"
-            )
+    return "\n\n".join(blocos)
 
-        if on_progress:
-            on_progress("✍️ Montando prompt da sentença...")
+def _montar_mensagens_sentenca(relatorio: str, contexto: str, instrucoes_usuario: Optional[str]) -> List[Dict[str, str]]:
+    relatorio = (relatorio or "").strip()
+    contexto = (contexto or "").strip()
+    instr = (instrucoes_usuario or "").strip()
+    instr_block = f"INSTRUÇÕES ADICIONAIS DO USUÁRIO:\n{instr}\n\n" if instr else ""
 
-        prompt = f"""
-### CONTEXTO
-Você é um assistente judicial especializado na elaboração de sentenças. Com base no relatório do processo e nos documentos de referência fornecidos, você deve gerar uma sentença judicial completa. Siga rigorosamente a estrutura e requisitos abaixo, mas NÃO inclua os títulos das seções (como 'Fundamentação', 'Mérito', 'Dispositivo', etc.) na resposta final. Apenas escreva o texto corrido da sentença, respeitando a ordem lógica das seções, mas sem indicar seus títulos explicitamente. A seguir há exemplos de sentenças judiciais com relatório, fundamentação e dispositivo:
-
-{contexto}
-
-Agora, dado o NOVO RELATÓRIO abaixo, gere a fundamentação e o dispositivo:
+    user_msg = f"""
+TAREFA: Gerar sentença (fundamentação + dispositivo) **estritamente** baseada no CONTEXTO.
 
 NOVO RELATÓRIO:
 {relatorio}
-{instrucoes_adicionais}
+
+{instr_block}
+=== CONTEXTO (única fonte de verdade) ===
+
+{contexto}
+=== FIM DO CONTEXTO ===
+
 ## ESTRUTURA DA SENTENÇA
 
+### 0. JULGAMENTO ANTECIPADO
+- Verifique no RELATÓRIO se houve produção de provas, como audiência de instrução e julgamento, perícia técnica, etc. Caso as partes não tenham produzido provas, anuncie o julgamento antecipado previsto no art. 355, conforme o CONTEXTO.
+
 ### 1. QUESTÕES PRELIMINARES
-- Analise o processo e identifique se há questões preliminares suscitadas na contestação.
+- Analise o processo e identifique se há, na CONTESTAÇÃO questões PRELIMINARES suscitadas (exemplo: inépcia da inicial, impugnação ao valor da causa, falta de interesse de agir, prescrição, etc.).
 - Se houver preliminares, desenvolva a fundamentação para cada uma delas separadamente.
-- Se não houver preliminares, inicie com a frase: "Ausentes questões preliminares, passo ao mérito."
+- Se não houver preliminares, escreva a frase "Ausentes questões preliminares, passo ao mérito." e siga para o mérito.
 
 ### 2. MÉRITO
 - Inicie afirmando claramente o(s) fato(s) que constitui(em) a causa de pedir do autor.
@@ -170,7 +137,7 @@ NOVO RELATÓRIO:
   - A doutrina relevante
 
 #### REGRAS IMPORTANTES PARA A FUNDAMENTAÇÃO:
-- As citações de lei, doutrina ou jurisprudência devem ser reproduzidas EXATAMENTE como constam nos documentos de referência, sem alterações.
+- As citações de lei, doutrina ou jurisprudência devem ser reproduzidas **EXATAMENTE** como constam nos documentos de referência, sem alterações.
 - A argumentação deve ser coerente, lógica e completa.
 - Utilize linguagem técnica-jurídica apropriada.
 - Analise todos os pedidos formulados na inicial.
@@ -180,13 +147,16 @@ NOVO RELATÓRIO:
 - Fixe os honorários advocatícios conforme critérios do art. 85 do CPC.
 
 ### 4. CONCLUSÃO OBRIGATÓRIA
-Após o dispositivo e a condenação em honorários, encerre a sentença com EXATAMENTE o seguinte texto, sem nenhuma alteração:
+Após o dispositivo e a condenação em honorários, encerre a sentença com **EXATAMENTE** o seguinte texto, **sem nenhuma alteração**:
 
-"Opostos embargos de declaração com efeito modificativo, intime-se a parte embargada para, querendo, manifestar-se no prazo de 05 (cinco) dias. (art. 1.023, § 2º, do CPC/2015), e decorrido o prazo, com ou sem manifestação, voltem conclusos. 
+"Opostos embargos de declaração com efeito modificativo, intime-se a parte embargada para, querendo, manifestar-se no prazo de 05 (cinco) dias. (art. 1.023, § 2º, do CPC/2015), e decorrido o prazo, com ou sem manifestação, voltem conclusos.
+
 Na hipótese de interposição de recurso de apelação, intime-se a parte apelada para apresentar contrarrazões (art. 1010, §1º, do CPC/2015). Havendo alegação – em sede de contrarrazões - de questões resolvidas na fase de conhecimento as quais não comportaram agravo de instrumento, intime-se a parte adversa (recorrente) para, em 15 (quinze) dias, manifestar-se a respeito delas (art. 1.009, §§ 1º e 2º, do CPC/2015). Havendo interposição de apelação adesiva, intime-se a parte apelante para contrarrazões, no prazo de 15 (quinze) dias (art. 1010, §2º, do CPC/2015). Em seguida, com ou sem resposta, sigam os autos ao e. Tribunal de Justiça do Estado de Pernambuco, com os cumprimentos deste Juízo (art. 1010, §3º, do CPC/2015).
+
 Após o trânsito em julgado, nada mais sendo requerido, arquivem-se os autos, com as cautelas de estilo, independentemente de nova determinação.
-Intimem-se, atentando-se para a regra prevista no art.346 do CPC/2015.
+
 Comunicações processuais necessárias.
+
 Cumpra-se.
 Recife-PE, data da assinatura digital.
 
@@ -196,21 +166,116 @@ Juíza de Direito"
 
 ## INSTRUÇÕES FINAIS
 - Leia atentamente o relatório e todos os documentos de referência antes de iniciar a redação.
-- Siga rigorosamente a estrutura indicada.
+- **Siga rigorosamente a estrutura indicada acima.**
 - Certifique-se de que o texto final está coeso, coerente e tecnicamente preciso.
-- Não omita nenhum dos elementos obrigatórios da sentença.
+- **Não omita** nenhum dos elementos obrigatórios da sentença.
 - As citações de leis, doutrina e jurisprudência devem ser exatamente iguais às dos documentos de referência.
 """
-        if on_progress:
-            on_progress("🎯 Gerando sentença...")
-        resultado = await _call_llm(prompt, on_progress)
-        if on_progress:
-            on_progress("✅ Sentença gerada com sucesso!")
-        return resultado
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_SENTENCA},
+        {"role": "user", "content": user_msg},
+    ]
 
-    except Exception as e:
-        error_msg = f"Erro na geração da sentença: {e}"
-        print(error_msg)
-        if on_progress:
-            on_progress(f"❌ {error_msg}")
-        return f"Erro ao gerar sentença: {e}"
+
+# ===================== Chamada às APIs =====================
+
+def _extract_text_from_response(content: Any) -> str:
+    """Extrai texto de respostas do Anthropic (content blocks)."""
+    try:
+        parts = []
+        for block in content or []:
+            # Estrutura comum: {"type": "text", "text": "..."}
+            t = block.get("text") if isinstance(block, dict) else None
+            if isinstance(t, str) and t:
+                parts.append(t)
+        return "".join(parts)
+    except Exception:
+        return ""
+
+
+def _call_llm(*, messages: List[Dict[str, str]], on_progress: Optional[Callable[[str], None]] = None) -> str:
+    max_retries = 5
+    base_delay = 1
+    param_name = _length_param_name(LLM_MODEL)
+    limit = _cap_limit_tokens(LLM_MODEL, messages, LLM_MAX_TOKENS)
+    
+    for attempt in range(max_retries):
+        try:
+            if on_progress:
+                on_progress(f"🤖 Consultando {LLM_PROVIDER.capitalize()} ({LLM_MODEL})... (Tentativa {attempt+1})")
+
+            if LLM_PROVIDER == "openai":
+           
+                kwargs = {
+                    "model": LLM_MODEL,
+                    "messages": messages,
+                    param_name: limit,           
+                }
+
+                # gpt-5 não aceita temperature ≠ 1
+                if not LLM_MODEL.startswith("gpt-5"):
+                    kwargs["temperature"] = LLM_TEMPERATURE
+
+                seed_env = os.getenv("LLM_SEED")
+                if seed_env and seed_env.isdigit():
+                    kwargs["seed"] = int(seed_env)
+
+                resp = _openai.chat.completions.create(**kwargs)
+                return (resp.choices[0].message.content or "").strip()
+
+            else:  # anthropic
+                resp = _anthropic.messages.create(
+                    model=LLM_MODEL,
+                    max_tokens=LLM_MAX_TOKENS,
+                    temperature=LLM_TEMPERATURE,
+                    messages=messages,
+                )
+                # extrai texto dos blocks:
+                text = "".join([b.get("text","") for b in getattr(resp, "content", []) if isinstance(b, dict)])
+                return (text or "").strip()
+
+        except Exception as e:
+            # backoff simples para erros transitórios
+            transient = ["529", "overloaded", "500", "503", "rate_limit", "timeout"]
+            if any(t in str(e).lower() for t in transient) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                if on_progress: on_progress(f"⏳ API indisponível. Tentando de novo em {delay:.2f}s...")
+                time.sleep(delay)
+            else:
+                if on_progress: on_progress(f"❌ Erro na chamada da API {LLM_PROVIDER}: {e}")
+                return f"Erro na chamada da API {LLM_PROVIDER}: {e}"
+    return "Erro: A chamada da API falhou após múltiplas tentativas."
+
+# ===================== Função principal =====================
+
+async def gerar_sentenca_llm(
+    *,
+    relatorio: str,
+    exemplos: Optional[List[Dict[str, Any]]] = None,
+    docs: Optional[List[Dict[str, Any]]] = None,   # <- retrocompatível com main.py
+    instrucoes_usuario: Optional[str] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> str:
+    if exemplos is None and docs is not None:
+        exemplos = docs
+
+    if on_progress: on_progress("📚 Preparando CONTEXTO...")
+    contexto = build_context(exemplos or [])
+
+    if on_progress: on_progress("✍️ Montando mensagens...")
+    messages = _montar_mensagens_sentenca(relatorio, contexto, instrucoes_usuario)
+
+    if on_progress: on_progress("🎯 Gerando sentença...")
+
+    # roda a chamada bloqueante em thread, já que o endpoint é async
+    loop = asyncio.get_running_loop()
+    resultado = await loop.run_in_executor(None, lambda: _call_llm(messages=messages, on_progress=on_progress))
+
+    if on_progress: on_progress("✅ Sentença gerada com sucesso!")
+    return resultado
+
+
+__all__ = [
+    "gerar_sentenca_llm",
+    "build_context",
+]

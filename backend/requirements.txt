@@ -16,10 +16,7 @@ python-multipart
 langchain
 langchain-community
 langchain-openai
-langgraph
 langchain-core
-networkx
-transformers
 requests
 pypdf
 anthropic>=0.21.3
@@ -31,4 +28,9 @@ sseclient-py
 sse-starlette>=1.0.6
 pdfminer.six
 PyPDF2
-qdrant-client
+jose
+asyncpg
+python-jose[cryptography]
+pydantic[email]
+email-validator
+gunicorn

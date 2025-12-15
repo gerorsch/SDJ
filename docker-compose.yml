@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   # ───────── Banco de Dados ─────────
   postgres:
@@ -17,7 +15,7 @@ services:
       retries: 5
       start_period: 5s
     ports:
-      - "5432:5432"
+      - "5434:5432"  # Porta externa 5434, interna 5432
     networks:
       - network
 
@@ -54,7 +52,8 @@ services:
     env_file:
       - .env
     working_dir: /app
-    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    # Modificado para usar gunicorn com Uvicorn workers (conforme referência)
+    command: gunicorn --conf gunicorn_conf.py main:app
     ports:
       - "8010:8001"
     environment:
@@ -66,6 +65,9 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LLM_API_URL=https://api.openai.com/v1/chat/completions
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      - CELERY_RESULT_BACKEND=rpc://
     volumes:
       # Volumes temporários para uploads/outputs
       - uploads_vol:/tmp/uploads
@@ -76,38 +78,86 @@ services:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     networks:
       - network
 
-  # ───────── Frontend ─────────
-  streamlit:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: rag_app
-    restart: always
-    ports:
-      - "8501:8501"
+  # ───────── Broker de Fila ─────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rag_rabbitmq
     environment:
-      - API_URL=http://fastapi:8001
-      - DEBUG_MODE=true
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - network
+
+  # ───────── Worker Celery ─────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag_celery_worker
+    restart: always
+    env_file:
+      - .env
+    working_dir: /app
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2
+    environment:
       - ELASTICSEARCH_HOST=http://elasticsearch:9200
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB:-rag_database}
+      - POSTGRES_USER=${POSTGRES_USER:-rag_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag_password}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_API_URL=https://api.openai.com/v1/chat/completions
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      - CELERY_RESULT_BACKEND=rpc://
     volumes:
-      # Volumes temporários compartilhados
       - uploads_vol:/tmp/uploads
       - outputs_vol:/tmp/outputs
-      - ./frontend:/app
-      - ./frontend/.streamlit:/app/.streamlit:ro
+      - ./backend:/app
     depends_on:
-      fastapi:
-        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
       elasticsearch:
         condition: service_healthy
     networks:
       - network
-    command: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+
+  # ───────── Frontend (Next.js + TypeScript) ─────────
+  frontend:
+    build:
+      context: ./frontend-next
+      dockerfile: Dockerfile
+    container_name: sdj_frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://fastapi:8001
+      - NODE_ENV=production
+    depends_on:
+      fastapi:
+        condition: service_started
+    networks:
+      - network
 
   # ───────── Proxy Reverso ─────────
   nginx:
@@ -118,7 +168,7 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - streamlit
+      - frontend
       - fastapi
     networks:
       - network
@@ -137,4 +187,6 @@ volumes:
   postgres_data:
     driver: local
   elasticsearch_data:
+    driver: local
+  rabbitmq_data:
     driver: local

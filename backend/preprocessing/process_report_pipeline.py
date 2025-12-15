@@ -6,32 +6,113 @@ import re
 import sys
 import textwrap
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from types import SimpleNamespace
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
+from langchain_core.language_models import BaseLanguageModel
 import anthropic
 from pypdf.errors import PdfReadError
 from pypdf import PdfReader
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
+
 
 # ───────────────────────────────────────── config ──────────────────────────
 @dataclass
 class Config:
     summary_model: str = os.getenv("SUMMARY_MODEL", "gpt-4o-mini")
-    report_model:  str = os.getenv("REPORT_MODEL",  "claude-sonnet-4-20250514")
-    temperature:   float = float(os.getenv("TEMPERATURE", 0.3))
-    max_tokens:    int = int(os.getenv("MAX_TOKENS", 2048))
-    fallback_chars:int = int(os.getenv("FALLBACK_CHARS", 8000))
-    verbose:       bool  = os.getenv("VERBOSE", "true").lower() in ("1","true","yes","t")
+    report_model:  str = os.getenv("REPORT_MODEL",  "gpt-5")
+    temperature:   float = float(os.getenv("TEMPERATURE", 0.2))
+    max_tokens:    int = int(os.getenv("MAX_TOKENS", 4096))
+    fallback_chars:int = int(os.getenv("FALLBACK_CHARS", 10000))
+    verbose:       bool  = os.getenv("VERBOSE", "false").lower() in ("1","true","yes","t")
 
 def log(msg: str, cfg: Config):
     if cfg.verbose:
         print(msg, file=sys.stderr)
+        
+# --- NOVO: FUNÇÃO DE TAREFA PARA OCR PARALELO ---
+# Esta função precisa ser de "nível superior" para funcionar com ProcessPoolExecutor
+def ocr_page_task(task_args: Tuple[bytes, int, str]) -> Tuple[int, str]:
+    """
+    Executa OCR em uma única página de um PDF.
+    Retorna uma tupla com (numero_da_pagina, texto_extraido).
+    """
+    pdf_bytes, page_number, lang = task_args
+    try:
+        pil_images = convert_from_bytes(
+            pdf_bytes,
+            dpi=300,
+            first_page=page_number,
+            last_page=page_number
+        )
+        if pil_images:
+            text = pytesseract.image_to_string(pil_images[0], lang=lang)
+            return (page_number, text)
+    except Exception as e:
+        print(f"Erro no OCR da página {page_number}: {e}", file=sys.stderr)
+    
+    return (page_number, "")
+
+# --- NOVO: FUNÇÃO PARA EXTRAIR TEXTO COM OCR PARALELO ---
+def extract_text_from_pdf(pdf_path: Path, cfg: Config, on_progress: Optional[Callable[[str], None]] = None) -> List[SimpleNamespace]:
+    """
+    Carrega o texto de um PDF, aplicando OCR em paralelo nas páginas que forem imagens.
+    """
+    pages_content = []
+    pages_to_ocr = []
+    
+    try:
+        reader = PdfReader(str(pdf_path), strict=False)
+        num_pages = len(reader.pages)
+        if on_progress: on_progress(f"📄 PDF com {num_pages} páginas detectado. Lendo texto...")
+
+        # Fase 1: Extrai texto direto e identifica páginas para OCR
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+                if len(text.strip()) < 100:
+                    pages_to_ocr.append(i + 1)
+                    pages_content.append(SimpleNamespace(page_content=None, metadata={'page': i})) # Placeholder
+                else:
+                    pages_content.append(SimpleNamespace(page_content=text, metadata={'page': i}))
+            except Exception:
+                log(f"   – erro extraindo texto da página {i+1}, marcando para OCR.", cfg)
+                pages_to_ocr.append(i + 1)
+                pages_content.append(SimpleNamespace(page_content=None, metadata={'page': i})) # Placeholder
+
+    except Exception as e:
+        log(f"⚠️ Leitura do PDF falhou: {e}. O documento pode estar corrompido.", cfg)
+        raise
+
+    # Fase 2: Executa OCR em paralelo, se necessário
+    if pages_to_ocr:
+        if on_progress: on_progress(f"⚙️ Executando OCR em {len(pages_to_ocr)} páginas em paralelo...")
+        pdf_bytes = pdf_path.read_bytes()
+        tasks = [(pdf_bytes, page_num, 'por') for page_num in pages_to_ocr]
+
+        with ProcessPoolExecutor() as executor:
+            results = executor.map(ocr_page_task, tasks)
+            
+            for page_num, ocr_text in results:
+                # O índice na lista é page_num - 1
+                pages_content[page_num - 1].page_content = ocr_text
+
+    # Garante que nenhum conteúdo de página seja None
+    for page in pages_content:
+        if page.page_content is None:
+            page.page_content = ""
+
+    return pages_content
 
 # ────────────────────────────── detectar peça ─────────────────────────────
 PIECE_KWS: Dict[str, list[str]] = {
@@ -99,6 +180,24 @@ def extract_process_number(first_page_text: str) -> Optional[str]:
     
     return None
 
+
+def extract_id_from_text(text: str) -> Optional[str]:
+    """
+    Procura padrões de ID no rodapé:
+     - “ID 12345” ou “ID: 12345”
+     - “Num. 12345” ou “Núm. 12345”
+    """
+    patterns = [
+        r"\bID\s*[:\-]?\s*(\d+)\b",
+        r"(?:Num\.|Núm\.)\s*(\d+)"
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 def group_pages(pages: List, cfg: Config) -> tuple[Dict[str, List[str]], Optional[str]]:
     """
     Agrupa páginas por tipo de peça e extrai número do processo da primeira página
@@ -107,6 +206,8 @@ def group_pages(pages: List, cfg: Config) -> tuple[Dict[str, List[str]], Optiona
     cur: Optional[str] = None
     buf: List[str] = []
     process_number = None
+    # mapa de label -> ID capturado do rodapé
+    section_id_map: Dict[str,str] = {}
     
     for i, p in enumerate(pages):
         # Extrai número do processo da primeira página
@@ -122,6 +223,10 @@ def group_pages(pages: List, cfg: Config) -> tuple[Dict[str, List[str]], Optiona
             if buf:
                 groups.setdefault(cur or "outros", []).append("\n".join(buf))
                 buf = []
+                # novo bloco: captura ID no início da seção
+            page_id = extract_id_from_text(p.page_content)
+            if page_id:
+                section_id_map[lab] = page_id
             cur = lab
             log(f"→ nova peça '{lab}' na página {i+1}", cfg)
         buf.append(p.page_content)
@@ -129,7 +234,7 @@ def group_pages(pages: List, cfg: Config) -> tuple[Dict[str, List[str]], Optiona
     if buf:
         groups.setdefault(cur or "outros", []).append("\n".join(buf))
     
-    return groups, process_number
+    return groups, process_number, section_id_map
 
 # ─────────────────────────────── prompts ──────────────────────────────────
 SUMMARY_PT = PromptTemplate(
@@ -154,10 +259,11 @@ INSTRUCOES_COM_PROCESSO = textwrap.dedent("""
     INSTRUÇÕES ESPECÍFICAS
     - Inicie o relatório com "Processo nº {numero_processo}"
     - Não inclua os títulos formais das peças (ex: "Petição Inicial", "Despacho", "Decisão", etc.).
+    - Cada parágrafo gerado deve terminar com “(ID <número>)”;
+    - Use exatamente o número que aparece no rodapé.
     - Identifique os atos com uma frase introdutória direta e o número do ID entre parênteses, como nos exemplos abaixo:
-      - Foi concedida a justiça gratuita (ID 36457517).
-      - Tutela de urgência deferida (ID 37574668).
-      - Réplica apresentada (ID 42715461).
+      - Foi concedida a justiça gratuita e deferida a tutela de urgência (ID ___).
+      - Réplica apresentada (ID ___).
     - Ao tratar de manifestações das partes (petições), explique brevemente seu conteúdo jurídico.
     - Na contestação, redija um parágrafo mais desenvolvido, contendo:
       - Os principais fatos narrados;
@@ -191,10 +297,11 @@ INSTRUCOES_SEM_PROCESSO = textwrap.dedent("""
 
     INSTRUÇÕES ESPECÍFICAS
     - Não inclua os títulos formais das peças (ex: "Petição Inicial", "Despacho", "Decisão", etc.).
+    - Cada parágrafo gerado deve terminar com “(ID <número>)”;
+    - Use exatamente o número que aparece no rodapé.
     - Identifique os atos com uma frase introdutória direta e o número do ID entre parênteses, como nos exemplos abaixo:
-      - Foi concedida a justiça gratuita (ID 36457517).
-      - Tutela de urgência deferida (ID 37574668).
-      - Réplica apresentada (ID 42715461).
+      - Foi concedida a justiça gratuita e deferida a tutela de urgência (ID ___).
+      - Réplica apresentada (ID ___).
     - Ao tratar de manifestações das partes (petições), explique brevemente seu conteúdo jurídico.
     - Na contestação, redija um parágrafo mais desenvolvido, contendo:
       - Os principais fatos narrados;
@@ -232,9 +339,10 @@ RELATÓRIO:""",
 
 # ─────────────────────────── wrapper Claude CORRIGIDO ─────────────────────────────
 class AnthropicClaudeWrapper:
-    def __init__(self, model: str, max_tokens: int = 2048, temperature: float = 0.3):
+    def __init__(self, model: str, max_tokens: int = 4096, temperature: float = 0.2):
         self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.model = model
+
         self.max_tokens = max_tokens
         self.temperature = temperature
 
@@ -298,6 +406,43 @@ class AnthropicClaudeWrapper:
 
 # ───────────────────────── funções LLM CORRIGIDAS ────────────────────────────────────
 
+def get_llm(model_name: str, cfg: Config) -> BaseLanguageModel:
+    """
+    Seleciona dinamicamente o cliente LLM (OpenAI ou Anthropic)
+    com base no nome do modelo.
+    """
+    if model_name.startswith("gpt"):
+        log(f"Usando modelo OpenAI: {model_name}", cfg)
+        try:
+            return ChatOpenAI(
+                model=model_name,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                api_key=os.getenv("OPENAI_API_KEY") # Passando a chave explicitamente
+            )
+        except Exception as e:
+            log(f"Falha ao inicializar ChatOpenAI para o modelo '{model_name}': {e}", cfg)
+            # Se falhar (ex: chave inválida), cai no fallback
+            pass
+
+    elif model_name.startswith("claude"):
+        log(f"Usando modelo Anthropic: {model_name}", cfg)
+        return AnthropicClaudeWrapper(
+            model=model_name,
+            max_tokens=cfg.max_tokens,
+            temperature=cfg.temperature
+        )
+
+    # Fallback para um modelo padrão se o nome não for reconhecido OU se a inicialização falhar
+    log(f"⚠️ Modelo '{model_name}' não encontrado ou falhou ao inicializar. Usando fallback gpt-4o-mini.", cfg)
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=cfg.temperature,
+        max_tokens=cfg.max_tokens,
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+
+
 def _extract_text_safely(response) -> str:
     """
     Função auxiliar para extrair texto de respostas de LLM de forma segura.
@@ -335,63 +480,55 @@ def _extract_text_safely(response) -> str:
     # Fallback final
     return str(response)
 
-def get_llm(model: str, cfg: Config):
-    use_claude = os.getenv("USE_CLAUDE_FOR_REPORT", "false").lower() in ("1", "true", "yes", "t")
-    if use_claude and model.startswith("claude"):
-        return AnthropicClaudeWrapper(model=model, max_tokens=cfg.max_tokens, temperature=cfg.temperature)
-    else:
-        return ChatOpenAI(model_name=model, temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+# def get_llm(model: str, cfg: Config):
+#     use_claude = os.getenv("USE_CLAUDE_FOR_REPORT", "false").lower() in ("1", "true", "yes", "t")
+#     if use_claude and model.startswith("claude"):
+#         return AnthropicClaudeWrapper(model=model, max_tokens=cfg.max_tokens, temperature=cfg.temperature)
+#     else:
+#         return ChatOpenAI(model_name=model, temperature=cfg.temperature, max_tokens=cfg.max_tokens)
 
-def summarize(text: str, cfg: Config) -> str:
+def summarize(text: str, llm: BaseLanguageModel, cfg: Config) -> str:
     try:
-        llm = get_llm(cfg.summary_model, cfg)
         resp = (SUMMARY_PT | llm).invoke({"texto": text})
-        
-        # CORREÇÃO: Usa função auxiliar para extrair texto de forma segura
         content = _extract_text_safely(resp)
         return content.strip()
-    
     except Exception as e:
         print(f"Erro na função summarize: {e}", file=sys.stderr)
-        # Retorna um resumo básico em caso de erro
         return f"Documento processado com {len(text)} caracteres."
 
+
+from typing import Any
+
 def build_report(atos: str, process_number: Optional[str], cfg: Config) -> str:
-    """
-    Constrói o relatório final, incluindo número do processo se disponível
-    """
     try:
         llm = get_llm(cfg.report_model, cfg)
-        
-        # Escolhe as instruções corretas baseado na disponibilidade do número do processo
-        if process_number:
-            instructions = INSTRUCOES_COM_PROCESSO.format(numero_processo=process_number)
-        else:
-            instructions = INSTRUCOES_SEM_PROCESSO
-        
+
+        instructions = (
+            INSTRUCOES_COM_PROCESSO.format(numero_processo=process_number)
+            if process_number else INSTRUCOES_SEM_PROCESSO
+        )
         formatted_prompt = REPORT_PT.format(instr=instructions, linhas_atos=atos)
-        
-        if hasattr(llm, "invoke"):
+
+        # Se for o wrapper do Claude, ele quer {"prompt": ...}; caso contrário, passe string
+        if isinstance(llm, AnthropicClaudeWrapper):
             resp = llm.invoke({"prompt": formatted_prompt})
         else:
-            resp = llm.predict(formatted_prompt)
-        
-        # CORREÇÃO: Usa função auxiliar para extrair texto de forma segura
+            # ChatOpenAI (LangChain): aceita string diretamente
+            resp = llm.invoke(formatted_prompt)
+
         content = _extract_text_safely(resp)
-        
-        # Se temos número do processo mas ele não aparece no início do relatório, adiciona
+
         if process_number and not content.strip().startswith(f"Processo nº {process_number}"):
             content = f"Processo nº {process_number}\n\n{content.strip()}"
-        
+
         return content.strip()
-    
+
     except Exception as e:
         print(f"Erro na função build_report: {e}", file=sys.stderr)
-        # Retorna um relatório básico em caso de erro
         if process_number:
-            return f"Processo nº {process_number}\n\nRelatório: Processo analisado com base nos atos processuais fornecidos.\n\n{atos}"
-        else:
-            return f"Relatório: Processo analisado com base nos atos processuais fornecidos.\n\n{atos}"
+            return (f"Processo nº {process_number}\n\n"
+                    f"Relatório: Processo analisado com base nos atos processuais fornecidos.\n\n{atos}")
+        return f"Relatório: Processo analisado com base nos atos processuais fornecidos.\n\n{atos}"
 
 def clean_textblock_artifacts(text: str) -> str:
     """
@@ -420,97 +557,129 @@ def clean_textblock_artifacts(text: str) -> str:
     return text.strip()
 
 # ───────────────────────── geração principal ──────────────────────────────
+
+# def generate(
+#     pdf: Path,
+#     cfg: Config,
+#     on_progress: Optional[Callable[[str], None]] = None
+# ) -> str:
+#     # Esta linha agora seleciona dinamicamente o provedor para o resumo
+#     summary_llm = get_llm(cfg.summary_model, cfg)
+    
+#     # (O resto da função continua exatamente o mesmo)
+#     digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+#     cache_path = Path(f"/tmp/report_{digest}.txt")
+#     if cache_path.exists():
+#         log("♻️  Usando relatório em cache", cfg)
+#         if on_progress: on_progress("♻️ Usando relatório em cache...")
+#         return cache_path.read_text(encoding="utf-8")
+#     try:
+#         pages = extract_text_from_pdf(pdf, cfg, on_progress)
+#         groups, process_number, section_id_map = group_pages(pages, cfg)
+#         if process_number and on_progress: on_progress(f"📋 Processo nº {process_number} identificado")
+#         chunks_para_resumir: List[Tuple[str, str]] = []
+#         for label, blocos in groups.items():
+#             texto_secao = "\n".join(blocos)
+#             if len(texto_secao) > cfg.fallback_chars:
+#                 parts = [texto_secao[i : i + cfg.fallback_chars] for i in range(0, len(texto_secao), cfg.fallback_chars)]
+#             else:
+#                 parts = [texto_secao]
+#             for pi, part in enumerate(parts, start=1):
+#                 chunks_para_resumir.append((label, part))
+#         if on_progress: on_progress(f"🧠 Resumindo {len(chunks_para_resumir)} partes do processo em paralelo...")
+#         def _job(label_text: Tuple[str,str]) -> str:
+#             label, texto = label_text
+#             resumo = summarize(texto, summary_llm, cfg)
+#             id_real = section_id_map.get(label)
+#             if id_real: resumo = resumo.rstrip(".") + f" (ID {id_real})."
+#             return clean_textblock_artifacts(resumo)
+#         linhas: List[str] = []
+#         with ThreadPoolExecutor(max_workers=8) as pool:
+#             futures = { pool.submit(_job, lt): lt for lt in chunks_para_resumir }
+#             for fut in as_completed(futures):
+#                 linhas.append(fut.result())
+#         atos = "\n".join(linhas)
+#         if on_progress: on_progress("⚙️ Construindo relatório final...")
+#         report = build_report(atos, process_number, cfg)
+#         report_limpo = clean_textblock_artifacts(report)
+#         cache_path.write_text(report_limpo, encoding="utf-8")
+#         if on_progress: on_progress("✅ Relatório pronto!")
+#         return report_limpo
+#     except Exception as e:
+#         error_msg = f"Erro na geração do relatório: {str(e)}"
+#         print(error_msg, file=sys.stderr)
+#         if on_progress: on_progress(f"❌ {error_msg}")
+#         return f"Erro no processamento: {str(e)}"
+
 def generate(
     pdf: Path,
     cfg: Config,
     on_progress: Optional[Callable[[str], None]] = None
 ) -> str:
-    try:
-        # 1) Carrega o PDF, com fallback em caso de PdfReadError
-        try:
-            pages = PyPDFLoader(str(pdf)).load()
-        except PdfReadError as e:
-            log(f"⚠️ PyPDFLoader falhou ({e}), usando fallback com PdfReader(strict=False)", cfg)
-            reader = PdfReader(str(pdf), strict=False)
-            pages = []
-            for idx, page in enumerate(reader.pages, start=1):
-                try:
-                    text = page.extract_text() or ""
-                except PdfReadError:
-                    log(f"   – erro extraindo texto da página {idx}, pulando conteúdo", cfg)
-                    text = ""
-                pages.append(SimpleNamespace(page_content=text))
-
-        # progresso inicial
-        msg = f"📄 PDF com {len(pages)} páginas carregado"
-        log(msg, cfg)
-        if on_progress:
-            on_progress(msg)
-
-        # 2) Agrupa por peça e extrai número do processo
-        grupos, process_number = group_pages(pages, cfg)
+    summary_llm = get_llm(cfg.summary_model, cfg)
+    
+    # ── CACHE (sem alterações) ──
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    cache_path = Path(f"/tmp/report_{digest}.txt")
+    if cache_path.exists():
+        log("♻️  Usando relatório em cache", cfg)
+        if on_progress: on_progress("♻️ Usando relatório em cache...")
+        return cache_path.read_text(encoding="utf-8")
         
-        if process_number:
-            log(f"✅ Processo identificado: {process_number}", cfg)
-            if on_progress:
-                on_progress(f"📋 Processo nº {process_number} identificado")
+    try:
+        # 1) NOVO: Extrai texto do PDF com OCR paralelo para páginas de imagem
+        pages = extract_text_from_pdf(pdf, cfg, on_progress)
 
-        # 3) Lê e resume chunks
+        # 2) Agrupa por peça e extrai número do processo (sem alterações)
+        groups, process_number, section_id_map = group_pages(pages, cfg)
+        
+        if process_number and on_progress:
+            on_progress(f"📋 Processo nº {process_number} identificado")
+
+        # 3) Prepara os chunks para o resumo (sem alterações)
+        chunks_para_resumir: List[Tuple[str, str]] = []
+        for label, blocos in groups.items():
+            # ... (lógica de divisão de chunks grandes continua a mesma) ...
+            texto_secao = "\n".join(blocos)
+            if len(texto_secao) > cfg.fallback_chars:
+                parts = [texto_secao[i : i + cfg.fallback_chars] for i in range(0, len(texto_secao), cfg.fallback_chars)]
+            else:
+                parts = [texto_secao]
+            for pi, part in enumerate(parts, start=1):
+                chunks_para_resumir.append((label, part))
+        
+        if on_progress: on_progress(f"🧠 Resumindo {len(chunks_para_resumir)} partes do processo em paralelo...")
+
+        # 4) Paraleliza chamadas de resumo com ThreadPoolExecutor (sem alterações)
+        def _job(label_text: Tuple[str,str]) -> str:
+            label, texto = label_text
+            resumo = summarize(texto, summary_llm, cfg)
+            id_real = section_id_map.get(label)
+            if id_real: resumo = resumo.rstrip(".") + f" (ID {id_real})."
+            return clean_textblock_artifacts(resumo)
+
         linhas: List[str] = []
-        for label, blocos in grupos.items():
-            sec_msg = f"🔍 Lendo seção '{label}' ({len(blocos)} chunks)"
-            log(sec_msg, cfg)
-            if on_progress:
-                on_progress(sec_msg)
-            for bi, bl in enumerate(blocos, start=1):
-                chunk_msg = f"   • {label} (chunk {bi}/{len(blocos)})"
-                log(chunk_msg, cfg)
-                if on_progress:
-                    on_progress(chunk_msg)
-                if len(bl) > cfg.fallback_chars:
-                    parts = [bl[i : i + cfg.fallback_chars] for i in range(0, len(bl), cfg.fallback_chars)]
-                    for pi, pt in enumerate(parts, start=1):
-                        sub_msg = f"      ↳ subchunk {pi}/{len(parts)}"
-                        log(sub_msg, cfg)
-                        if on_progress:
-                            on_progress(sub_msg)
-                        summary_result = summarize(pt, cfg)
-                        # Limpa possíveis artefatos de TextBlock
-                        linhas.append(clean_textblock_artifacts(summary_result))
-                else:
-                    summary_result = summarize(bl, cfg)
-                    # Limpa possíveis artefatos de TextBlock
-                    linhas.append(clean_textblock_artifacts(summary_result))
+        with ThreadPoolExecutor(max_workers=8) as pool: # Aumentado para 8 workers
+            futures = { pool.submit(_job, lt): lt for lt in chunks_para_resumir }
+            for fut in as_completed(futures):
+                linhas.append(fut.result())
 
         atos = "\n".join(linhas)
 
-        # 4) Construção do relatório final
-        start_msg = "⚙️ Construindo relatório final..."
-        log(start_msg, cfg)
-        if on_progress:
-            on_progress(start_msg)
-        
-        # Passa o número do processo para o build_report
+        # 5) Construção do relatório final (sem alterações)
+        if on_progress: on_progress("⚙️ Construindo relatório final...")
         report = build_report(atos, process_number, cfg)
-        
-        # LIMPEZA FINAL: Remove qualquer artefato de TextBlock restante
         report_limpo = clean_textblock_artifacts(report)
+        cache_path.write_text(report_limpo, encoding="utf-8")
         
-        done_msg = "✅ Relatório pronto"
-        log(done_msg, cfg)
-        if on_progress:
-            on_progress(done_msg)
-
+        if on_progress: on_progress("✅ Relatório pronto!")
         return report_limpo
-    
+        
     except Exception as e:
         error_msg = f"Erro na geração do relatório: {str(e)}"
         print(error_msg, file=sys.stderr)
-        if on_progress:
-            on_progress(f"❌ {error_msg}")
-        # Retorna um relatório básico em caso de erro total
+        if on_progress: on_progress(f"❌ {error_msg}")
         return f"Erro no processamento: {str(e)}"
-
 # ───────────────────────────── CLI ────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(

@@ -14,19 +14,49 @@ load_dotenv()
 
 class ElasticsearchSetup:
     def __init__(self):
-        # Configuração Elasticsearch
-        self.es_host    = os.getenv("ELASTICSEARCH_HOST", "http://elasticsearch:9200")
+        """
+        Inicializa:
+          • Cliente Elasticsearch (priorizando Elastic Cloud)
+          • Cliente OpenAI
+        Variáveis esperadas em produção
+          ELASTIC_CLOUD_ID        id do deployment (ex.: "mydeploy:ZGZmLm…")
+          ELASTICSEARCH_API_KEY   api-key gerada no Cloud
+          ELASTICSEARCH_INDEX     nome do índice (default: sentencas_rag)
+          -- opcionalmente --
+          ELASTICSEARCH_HOST      http(s)://host:port   (em dev/local)
+        """
+        cloud_id = os.getenv("ELASTIC_CLOUD_ID")
+        api_key  = os.getenv("ELASTICSEARCH_API_KEY")
+        host     = os.getenv("ELASTICSEARCH_HOST")      # só use em dev/local
         self.index_name = os.getenv("ELASTICSEARCH_INDEX", "sentencas_rag")
-        self.es         = Elasticsearch(hosts=[self.es_host])
 
-        # Configuração OpenAI
+        if cloud_id and api_key:
+            print(f"🔌 ElasticsearchSetup → usando Elastic Cloud ({cloud_id.split(':',1)[0]})")
+            self.es = Elasticsearch(
+                cloud_id=cloud_id,
+                api_key=api_key,
+                headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=8"}
+            )
+        elif host:
+            print(f"🔌 ElasticsearchSetup → usando host explícito {host}")
+            self.es = Elasticsearch(
+                hosts=[host],
+                headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=8"},
+                verify_certs=host.startswith("https")
+            )
+        else:
+            raise RuntimeError(
+                "🛑 Defina ELASTIC_CLOUD_ID + ELASTICSEARCH_API_KEY (produção) "
+                "ou ELASTICSEARCH_HOST (desenvolvimento)"
+            )
+
+        # ─── OpenAI ──────────────────────────────────────────────────────────
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key:
             raise ValueError("❌ OPENAI_API_KEY não encontrada nas variáveis de ambiente")
         self.openai_client = OpenAI(api_key=openai_key)
 
-        print(f"→ Conectando ao Elasticsearch em {self.es_host}")
-        print("→ Cliente OpenAI configurado")
+        print("✅ Cliente OpenAI configurado")
 
     def wait_for_elasticsearch(self, max_retries: int = 30):
         """Aguarda Elasticsearch ficar disponível"""
@@ -137,7 +167,7 @@ class ElasticsearchSetup:
         try:
             # Se já existir, pula imediatamente
             if self.es.exists(index=self.index_name, id=doc_id):
-                print(f"⭐ Documento {doc_id} já indexado — pulando")
+                # print(f"⭐ Documento {doc_id} já indexado — pulando")
                 return False
         
             julgado = row.get("julgado", "")
@@ -209,7 +239,6 @@ class ElasticsearchSetup:
             return []
 
     def setup(self):
-        """Setup completo do Elasticsearch: índice + dados + teste"""
         print("🚀 Iniciando setup do Elasticsearch...")
         self.wait_for_elasticsearch()
         self.create_index()
@@ -217,31 +246,28 @@ class ElasticsearchSetup:
         count = self.get_document_count()
         print(f"📊 Documentos atuais no índice: {count}")
 
-        if count == 0:
-            print("📚 Índice vazio - carregando dados iniciais...")
-            df = self.load_sentences_from_csv()
-            if df is not None and len(df) > 0:
-                print(f"→ Processando {len(df)} sentenças...")
-                success = 0
-                for i, row in df.iterrows():
-                    if self.index_sentence(row, f"sentence_{i}"):
-                        success += 1
-                    time.sleep(0.1)
-                    if (i+1) % 10 == 0:
-                        print(f"→ {i+1}/{len(df)} documentos processados")
-                print(f"✅ Setup completo! {success}/{len(df)} documentos indexados")
-            else:
-                print("⚠️ Sem dados para indexar")
+        # SEMPRE tentar indexar (idempotente por ID)
+        df = self.load_sentences_from_csv()
+        if df is not None and len(df) > 0:
+            print(f"→ Processando {len(df)} sentenças...")
+            success = 0
+            for i, row in df.iterrows():
+                if self.index_sentence(row, f"sentence_{i}"):
+                    success += 1
+                # opcional: reduza o sleep para acelerar retomadas
+                # time.sleep(0.1)
+                if (i+1) % 100 == 0:
+                    print(f"→ {i+1}/{len(df)} processadas (novas: {success})")
+            final = self.get_document_count()
+            print(f"✅ Setup completo! Novas indexadas: {success} | Total no índice: {final}")
         else:
-            print("✅ Índice já populado - setup completo")
+            print("⚠️ Sem dados para indexar")
 
         # Teste rápido
         print("🔍 Testando busca...")
         res = self.search_similar("ação de cobrança", size=2)
-        if res:
-            print(f"✅ Teste OK - {len(res)} resultados")
-        else:
-            print("⚠️ Teste de busca não retornou nada")
+        print("✅ Teste OK" if res else "⚠️ Teste de busca não retornou nada")
+
 
 def setup_elasticsearch():
     """Função de entrada para o FastAPI startup"""
